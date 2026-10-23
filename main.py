@@ -1,169 +1,215 @@
-import streamlit as st
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
-DATA_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads/main/NYC_weather_2009-10-03_to_2026-05-25.csv"
+WEATHER_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads/main/NYC_weather_2009-10-03_to_2026-05-25.csv"
+FLU_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads/main/NYC_influenza_2009-10-03_to_2022-12-29%20(4).csv"
 
-st.set_page_config(page_title="NYC 날씨 시각화", layout="wide")
-st.title("🌦️ 뉴욕(NYC) 날씨 데이터 시각화 (2009~2026)")
+st.set_page_config(page_title="NYC 날씨 & 인플루엔자", layout="wide")
+st.title("🤧 뉴욕(NYC) 날씨와 인플루엔자의 관계")
 
 
+# ---------- 데이터 불러오기 ----------
 @st.cache_data
-def load_data(url):
+def load_weather(url):
     df = pd.read_csv(url)
     df["DATE"] = pd.to_datetime(df["DATE"])
     df = df.sort_values("DATE").reset_index(drop=True)
     df["TAVG"] = (df["TMIN"] + df["TMAX"]) / 2
-    df["YEAR"] = df["DATE"].dt.year
-    df["MONTH"] = df["DATE"].dt.month
     return df
 
 
-df = load_data(DATA_URL)
+@st.cache_data
+def load_flu(url):
+    df = pd.read_csv(url)
+    return df
+
+
+weather = load_weather(WEATHER_URL)
+flu_raw = load_flu(FLU_URL)
 
 # ---------- 사이드바 ----------
 st.sidebar.header("⚙️ 설정")
 
-unit = st.sidebar.radio("온도 단위", ["°F (화씨)", "°C (섭씨)"])
-rain_unit = st.sidebar.radio("강수/적설 단위", ["inch", "mm"])
+# 날짜 열 찾기
+guess = [c for c in flu_raw.columns if "date" in c.lower()]
+default_idx = list(flu_raw.columns).index(guess[0]) if guess else 0
+flu_date_col = st.sidebar.selectbox(
+    "인플루엔자 데이터의 날짜 열", flu_raw.columns, index=default_idx
+)
 
-min_d, max_d = df["DATE"].min().date(), df["DATE"].max().date()
+flu = flu_raw.copy()
+flu[flu_date_col] = pd.to_datetime(flu[flu_date_col], errors="coerce")
+flu = flu.dropna(subset=[flu_date_col]).sort_values(flu_date_col).reset_index(drop=True)
+flu = flu.rename(columns={flu_date_col: "DATE"})
+
+flu_num_cols = flu.select_dtypes(include="number").columns.tolist()
+if not flu_num_cols:
+    st.error("인플루엔자 데이터에 숫자형 열이 없어요. 아래 원본을 확인해보세요.")
+    st.dataframe(flu_raw.head(20))
+    st.stop()
+
+flu_col = st.sidebar.selectbox("분석할 인플루엔자 지표", flu_num_cols)
+
+temp_unit = st.sidebar.radio("온도 단위", ["°F (화씨)", "°C (섭씨)"])
+
+# ---------- 날씨를 인플루엔자 날짜 구간에 맞춰 집계 ----------
+# 각 날씨 날짜를 "그 날짜 이후 가장 가까운 인플루엔자 날짜"에 배정
+flu_dates = flu[["DATE"]].rename(columns={"DATE": "FLU_DATE"})
+w = pd.merge_asof(
+    weather, flu_dates, left_on="DATE", right_on="FLU_DATE", direction="forward"
+).dropna(subset=["FLU_DATE"])
+
+w_agg = w.groupby("FLU_DATE").agg(
+    TMIN=("TMIN", "mean"),
+    TMAX=("TMAX", "mean"),
+    TAVG=("TAVG", "mean"),
+    PRCP=("PRCP", "sum"),
+    SNOW=("SNOW", "sum"),
+    SNWD=("SNWD", "mean"),
+).reset_index().rename(columns={"FLU_DATE": "DATE"})
+
+merged = pd.merge(flu, w_agg, on="DATE", how="inner")
+
+# 단위 변환
+t_label = "°F"
+if temp_unit.startswith("°C"):
+    for c in ["TMIN", "TMAX", "TAVG"]:
+        merged[c] = (merged[c] - 32) * 5 / 9
+    t_label = "°C"
+
+merged["YEAR"] = merged["DATE"].dt.year
+merged["MONTH"] = merged["DATE"].dt.month
+
+# 기간 선택
+min_d, max_d = merged["DATE"].min().date(), merged["DATE"].max().date()
 period = st.sidebar.date_input(
     "기간 선택", value=(min_d, max_d), min_value=min_d, max_value=max_d
 )
 if len(period) != 2:
     st.info("시작일과 종료일을 모두 선택해주세요.")
     st.stop()
-start, end = period
+merged = merged[
+    (merged["DATE"].dt.date >= period[0]) & (merged["DATE"].dt.date <= period[1])
+].copy()
 
-df = df[(df["DATE"].dt.date >= start) & (df["DATE"].dt.date <= end)].copy()
-
-# 단위 변환
-t_label = "°F"
-if unit.startswith("°C"):
-    for c in ["TMIN", "TMAX", "TAVG"]:
-        df[c] = (df[c] - 32) * 5 / 9
-    t_label = "°C"
-
-r_label = "in"
-if rain_unit == "mm":
-    for c in ["PRCP", "SNOW", "SNWD"]:
-        df[c] = df[c] * 25.4
-    r_label = "mm"
-
-if df.empty:
+if merged.empty:
     st.warning("선택한 기간에 데이터가 없습니다.")
     st.stop()
 
-# ---------- 요약 지표 ----------
+weather_cols = ["TMIN", "TMAX", "TAVG", "PRCP", "SNOW", "SNWD"]
+weather_names = {
+    "TMIN": f"최저기온({t_label})",
+    "TMAX": f"최고기온({t_label})",
+    "TAVG": f"평균기온({t_label})",
+    "PRCP": "강수량 합계(in)",
+    "SNOW": "신적설 합계(in)",
+    "SNWD": "적설깊이 평균(in)",
+}
+
+# ---------- 요약 ----------
 st.subheader("📋 요약")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("데이터 일수", f"{len(df):,}일")
-c2.metric("평균 기온", f"{df['TAVG'].mean():.1f}{t_label}")
-c3.metric("최고 기온 기록", f"{df['TMAX'].max():.1f}{t_label}")
-c4.metric("최저 기온 기록", f"{df['TMIN'].min():.1f}{t_label}")
+c1.metric("합쳐진 행 수", f"{len(merged):,}")
+c2.metric("기간", f"{period[0]} ~ {period[1]}")
+c3.metric(f"{flu_col} 평균", f"{merged[flu_col].mean():,.2f}")
+c4.metric(f"{flu_col} 최댓값", f"{merged[flu_col].max():,.2f}")
 
-with st.expander("원본 데이터 보기"):
-    st.dataframe(df, use_container_width=True)
+with st.expander("원본 인플루엔자 데이터 보기"):
+    st.dataframe(flu_raw, use_container_width=True)
+with st.expander("합쳐진 데이터 보기"):
+    st.dataframe(merged, use_container_width=True)
+    st.caption(f"결측값 개수: {int(merged[[flu_col] + weather_cols].isna().sum().sum())}")
 
 # ---------- 탭 ----------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["🌡️ 기온 추이", "🌧️ 강수량", "❄️ 눈", "🗓️ 월별 패턴", "📅 연도별 추세", "🔥 상관관계"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📈 함께 보기", "🔵 산점도", "🗓️ 계절 패턴", "⏱️ 시차 분석", "🔥 상관관계"]
 )
 
-# 1. 기온 추이
+# 1. 이중 축 시계열
 with tab1:
-    st.markdown("#### 일별 최저/최고 기온")
-    window = st.slider("이동평균 (일)", 1, 60, 7)
-    plot_df = df[["DATE", "TMIN", "TMAX"]].copy()
-    plot_df["TMIN"] = plot_df["TMIN"].rolling(window, min_periods=1).mean()
-    plot_df["TMAX"] = plot_df["TMAX"].rolling(window, min_periods=1).mean()
-    fig = px.line(
-        plot_df, x="DATE", y=["TMIN", "TMAX"],
-        labels={"value": f"기온({t_label})", "variable": "구분"},
-        color_discrete_map={"TMIN": "royalblue", "TMAX": "tomato"},
+    wcol = st.selectbox("함께 볼 날씨 변수", weather_cols,
+                        format_func=lambda c: weather_names[c], index=2)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=merged["DATE"], y=merged[flu_col],
+                             name=flu_col, line=dict(color="crimson")))
+    fig.add_trace(go.Scatter(x=merged["DATE"], y=merged[wcol],
+                             name=weather_names[wcol], yaxis="y2",
+                             line=dict(color="royalblue")))
+    fig.update_layout(
+        yaxis=dict(title=flu_col),
+        yaxis2=dict(title=weather_names[wcol], overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+        hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### 일교차 (TMAX - TMIN)")
-    df["RANGE"] = df["TMAX"] - df["TMIN"]
-    fig = px.histogram(df, x="RANGE", nbins=40,
-                       labels={"RANGE": f"일교차({t_label})"})
-    st.plotly_chart(fig, use_container_width=True)
-
-# 2. 강수량
+# 2. 산점도
 with tab2:
-    st.markdown("#### 월별 총 강수량")
-    monthly = df.groupby(df["DATE"].dt.to_period("M"))["PRCP"].sum().reset_index()
-    monthly["DATE"] = monthly["DATE"].dt.to_timestamp()
-    fig = px.bar(monthly, x="DATE", y="PRCP",
-                 labels={"PRCP": f"강수량({r_label})", "DATE": "월"})
+    wcol2 = st.selectbox("X축 날씨 변수", weather_cols,
+                         format_func=lambda c: weather_names[c], index=2, key="sc")
+    sub = merged[[wcol2, flu_col, "MONTH"]].dropna()
+    fig = px.scatter(sub, x=wcol2, y=flu_col, color="MONTH", opacity=0.6,
+                     color_continuous_scale="Turbo",
+                     labels={wcol2: weather_names[wcol2]})
+    if len(sub) > 2:
+        k, b = np.polyfit(sub[wcol2], sub[flu_col], 1)
+        xs = np.linspace(sub[wcol2].min(), sub[wcol2].max(), 50)
+        fig.add_trace(go.Scatter(x=xs, y=k * xs + b, mode="lines",
+                                 name="추세선", line=dict(color="black", dash="dash")))
+        r = sub[wcol2].corr(sub[flu_col])
+        st.write(f"상관계수 r = **{r:.3f}**")
     st.plotly_chart(fig, use_container_width=True)
 
-    rainy = (df["PRCP"] > 0).sum()
-    st.write(f"🌧️ 비 온 날: **{rainy:,}일** ({rainy / len(df) * 100:.1f}%)")
-
-    top = df.nlargest(10, "PRCP")[["DATE", "PRCP"]]
-    st.markdown("#### 강수량 많았던 날 TOP 10")
-    st.dataframe(top, use_container_width=True)
-
-# 3. 눈
+# 3. 계절 패턴
 with tab3:
-    st.markdown("#### 적설 깊이(SNWD)와 신적설량(SNOW)")
+    st.markdown("#### 월별 평균")
+    m = merged.groupby("MONTH")[[flu_col, "TAVG"]].mean().reset_index()
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["DATE"], y=df["SNWD"], name="적설 깊이(SNWD)",
-                             fill="tozeroy"))
-    fig.add_trace(go.Bar(x=df["DATE"], y=df["SNOW"], name="신적설(SNOW)"))
-    fig.update_layout(yaxis_title=f"({r_label})")
+    fig.add_trace(go.Bar(x=m["MONTH"], y=m[flu_col], name=flu_col,
+                         marker_color="crimson", opacity=0.7))
+    fig.add_trace(go.Scatter(x=m["MONTH"], y=m["TAVG"], name=f"평균기온({t_label})",
+                             yaxis="y2", mode="lines+markers",
+                             line=dict(color="royalblue")))
+    fig.update_layout(
+        xaxis=dict(title="월", dtick=1),
+        yaxis=dict(title=flu_col),
+        yaxis2=dict(title=f"평균기온({t_label})", overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
-    snow_year = df.groupby("YEAR")["SNOW"].sum().reset_index()
-    st.markdown("#### 연도별 총 적설량")
-    fig = px.bar(snow_year, x="YEAR", y="SNOW",
-                 labels={"SNOW": f"적설량({r_label})"})
+    st.markdown("#### 연도 × 월 히트맵")
+    pivot = merged.pivot_table(index="YEAR", columns="MONTH",
+                               values=flu_col, aggfunc="mean")
+    fig = px.imshow(pivot, aspect="auto", color_continuous_scale="Reds",
+                    labels={"x": "월", "y": "연도", "color": flu_col})
     st.plotly_chart(fig, use_container_width=True)
 
-# 4. 월별 패턴
+# 4. 시차 분석
 with tab4:
-    st.markdown("#### 월별 평균 기온")
-    m = df.groupby("MONTH")[["TMIN", "TAVG", "TMAX"]].mean().reset_index()
-    fig = px.line(m, x="MONTH", y=["TMIN", "TAVG", "TMAX"], markers=True,
-                  labels={"value": f"기온({t_label})", "MONTH": "월"})
+    st.markdown("날씨가 변한 뒤 **몇 칸(행) 뒤**에 인플루엔자가 반응하는지 확인해요.")
+    st.caption("데이터가 주 단위라면 1칸 = 1주예요.")
+    wcol3 = st.selectbox("날씨 변수", weather_cols,
+                         format_func=lambda c: weather_names[c], index=2, key="lag")
+    max_lag = st.slider("최대 시차(칸)", 1, 20, 8)
+    rows = []
+    for k in range(0, max_lag + 1):
+        r = merged[flu_col].corr(merged[wcol3].shift(k))
+        rows.append({"시차": k, "상관계수": r})
+    lag_df = pd.DataFrame(rows)
+    fig = px.bar(lag_df, x="시차", y="상관계수", range_y=[-1, 1])
     st.plotly_chart(fig, use_container_width=True)
+    if lag_df["상관계수"].notna().any():
+        best = lag_df.loc[lag_df["상관계수"].abs().idxmax()]
+        st.success(f"절댓값이 가장 큰 시차: **{int(best['시차'])}칸** (r = {best['상관계수']:.3f})")
 
-    st.markdown("#### 월별 기온 분포 (박스플롯)")
-    fig = px.box(df, x="MONTH", y="TAVG",
-                 labels={"TAVG": f"평균기온({t_label})", "MONTH": "월"})
-    st.plotly_chart(fig, use_container_width=True)
-
-# 5. 연도별 추세
+# 5. 상관관계
 with tab5:
-    st.markdown("#### 연도별 평균 기온")
-    st.caption("※ 2009년과 2026년은 일부 기간만 있어 평균이 왜곡될 수 있어요.")
-    y = df.groupby("YEAR")["TAVG"].mean().reset_index()
-    fig = px.line(y, x="YEAR", y="TAVG", markers=True,
-                  labels={"TAVG": f"평균기온({t_label})"})
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("#### 연도 × 월 평균기온 히트맵")
-    pivot = df.pivot_table(index="YEAR", columns="MONTH", values="TAVG", aggfunc="mean")
-    fig = px.imshow(pivot, aspect="auto", color_continuous_scale="RdYlBu_r",
-                    labels={"color": f"기온({t_label})", "x": "월", "y": "연도"})
-    st.plotly_chart(fig, use_container_width=True)
-
-# 6. 상관관계
-with tab6:
-    cols = ["PRCP", "SNOW", "SNWD", "TMIN", "TMAX", "TAVG"]
-    corr = df[cols].corr()
+    cols = [flu_col] + weather_cols
+    corr = merged[cols].corr()
     fig = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r",
                     zmin=-1, zmax=1)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("#### 산점도")
-    cc1, cc2 = st.columns(2)
-    x = cc1.selectbox("X축", cols, index=4)
-    yv = cc2.selectbox("Y축", cols, index=0)
-    fig = px.scatter(df, x=x, y=yv, opacity=0.4, color="MONTH",
-                     color_continuous_scale="Turbo")
     st.plotly_chart(fig, use_container_width=True)
