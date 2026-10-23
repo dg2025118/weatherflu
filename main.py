@@ -8,23 +8,22 @@ WEATHER_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads
 FLU_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads/main/NYC_influenza_2009-10-03_to_2022-12-29%20(4).csv"
 
 st.set_page_config(page_title="NYC 날씨 & 인플루엔자", layout="wide")
-st.title("🤧 뉴욕(NYC) 날씨와 인플루엔자의 관계")
+st.title("🤧 뉴욕(NYC) 인플루엔자 기준 날씨 분석")
 
 
 # ---------- 데이터 불러오기 ----------
 @st.cache_data
 def load_weather(url):
     df = pd.read_csv(url)
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df.sort_values("DATE").reset_index(drop=True)
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
     df["TAVG"] = (df["TMIN"] + df["TMAX"]) / 2
     return df
 
 
 @st.cache_data
 def load_flu(url):
-    df = pd.read_csv(url)
-    return df
+    return pd.read_csv(url)
 
 
 weather = load_weather(WEATHER_URL)
@@ -33,45 +32,87 @@ flu_raw = load_flu(FLU_URL)
 # ---------- 사이드바 ----------
 st.sidebar.header("⚙️ 설정")
 
-# 날짜 열 찾기
 guess = [c for c in flu_raw.columns if "date" in c.lower()]
 default_idx = list(flu_raw.columns).index(guess[0]) if guess else 0
 flu_date_col = st.sidebar.selectbox(
     "인플루엔자 데이터의 날짜 열", flu_raw.columns, index=default_idx
 )
 
+date_meaning = st.sidebar.radio(
+    "인플루엔자 날짜의 의미",
+    ["구간의 끝 (그 날짜 이전 기간을 대표)", "구간의 시작 (그 날짜 이후 기간을 대표)"],
+)
+temp_unit = st.sidebar.radio("온도 단위", ["°F (화씨)", "°C (섭씨)"])
+
+# ---------- 인플루엔자 전처리 ----------
 flu = flu_raw.copy()
 flu[flu_date_col] = pd.to_datetime(flu[flu_date_col], errors="coerce")
-flu = flu.dropna(subset=[flu_date_col]).sort_values(flu_date_col).reset_index(drop=True)
-flu = flu.rename(columns={flu_date_col: "DATE"})
+flu = flu.dropna(subset=[flu_date_col]).rename(columns={flu_date_col: "DATE"})
+
+if flu.empty:
+    st.error("날짜 열이 올바르지 않아요. 사이드바에서 다른 열을 선택해보세요.")
+    st.dataframe(flu_raw.head(20))
+    st.stop()
+
+# 쉼표 포함 숫자(예: '1,234')를 숫자로 변환 시도
+for c in flu.columns:
+    if c != "DATE" and flu[c].dtype == object:
+        converted = pd.to_numeric(
+            flu[c].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+        if converted.notna().mean() > 0.5:
+            flu[c] = converted
+
+flu = flu.sort_values("DATE").drop_duplicates(subset="DATE").reset_index(drop=True)
 
 flu_num_cols = flu.select_dtypes(include="number").columns.tolist()
 if not flu_num_cols:
-    st.error("인플루엔자 데이터에 숫자형 열이 없어요. 아래 원본을 확인해보세요.")
+    st.error("인플루엔자 데이터에 숫자형 열이 없어요. 원본을 확인해보세요.")
     st.dataframe(flu_raw.head(20))
     st.stop()
 
 flu_col = st.sidebar.selectbox("분석할 인플루엔자 지표", flu_num_cols)
 
-temp_unit = st.sidebar.radio("온도 단위", ["°F (화씨)", "°C (섭씨)"])
+# ---------- 날씨를 인플루엔자 날짜 구간으로 집계 ----------
+flu_dates = flu["DATE"].to_numpy(dtype="datetime64[ns]")
+w = weather.copy()
+w_dates = w["DATE"].to_numpy(dtype="datetime64[ns]")
 
-# ---------- 날씨를 인플루엔자 날짜 구간에 맞춰 집계 ----------
-# 각 날씨 날짜를 "그 날짜 이후 가장 가까운 인플루엔자 날짜"에 배정
-flu_dates = flu[["DATE"]].rename(columns={"DATE": "FLU_DATE"})
-w = pd.merge_asof(
-    weather, flu_dates, left_on="DATE", right_on="FLU_DATE", direction="forward"
-).dropna(subset=["FLU_DATE"])
+if date_meaning.startswith("구간의 끝"):
+    # 날씨 날짜 이후 가장 가까운 인플루엔자 날짜에 배정
+    idx = np.searchsorted(flu_dates, w_dates, side="left")
+else:
+    # 날씨 날짜 이전(같은 날 포함) 가장 가까운 인플루엔자 날짜에 배정
+    idx = np.searchsorted(flu_dates, w_dates, side="right") - 1
 
-w_agg = w.groupby("FLU_DATE").agg(
-    TMIN=("TMIN", "mean"),
-    TMAX=("TMAX", "mean"),
-    TAVG=("TAVG", "mean"),
-    PRCP=("PRCP", "sum"),
-    SNOW=("SNOW", "sum"),
-    SNWD=("SNWD", "mean"),
-).reset_index().rename(columns={"FLU_DATE": "DATE"})
+valid = (idx >= 0) & (idx < len(flu_dates))
+w = w[valid].copy()
+w["DATE_KEY"] = flu_dates[idx[valid]]
 
-merged = pd.merge(flu, w_agg, on="DATE", how="inner")
+# 구간 길이가 너무 길게 벌어진 날(데이터 공백)은 제외: 최대 14일
+gap_days = np.abs((w["DATE_KEY"].to_numpy() - w["DATE"].to_numpy()) / np.timedelta64(1, "D"))
+w = w[gap_days <= 14]
+
+w_agg = (
+    w.groupby("DATE_KEY")
+    .agg(
+        TMIN=("TMIN", "mean"),
+        TMAX=("TMAX", "mean"),
+        TAVG=("TAVG", "mean"),
+        PRCP=("PRCP", "sum"),
+        SNOW=("SNOW", "sum"),
+        SNWD=("SNWD", "mean"),
+        WEATHER_DAYS=("DATE", "count"),
+    )
+    .reset_index()
+    .rename(columns={"DATE_KEY": "DATE"})
+)
+
+merged = flu.merge(w_agg, on="DATE", how="inner")
+
+if merged.empty:
+    st.error("합쳐진 데이터가 없어요. 날짜 열 선택을 확인해주세요.")
+    st.stop()
 
 # 단위 변환
 t_label = "°F"
@@ -91,6 +132,7 @@ period = st.sidebar.date_input(
 if len(period) != 2:
     st.info("시작일과 종료일을 모두 선택해주세요.")
     st.stop()
+
 merged = merged[
     (merged["DATE"].dt.date >= period[0]) & (merged["DATE"].dt.date <= period[1])
 ].copy()
@@ -101,8 +143,8 @@ if merged.empty:
 
 weather_cols = ["TMIN", "TMAX", "TAVG", "PRCP", "SNOW", "SNWD"]
 weather_names = {
-    "TMIN": f"최저기온({t_label})",
-    "TMAX": f"최고기온({t_label})",
+    "TMIN": f"최저기온 평균({t_label})",
+    "TMAX": f"최고기온 평균({t_label})",
     "TAVG": f"평균기온({t_label})",
     "PRCP": "강수량 합계(in)",
     "SNOW": "신적설 합계(in)",
@@ -117,11 +159,18 @@ c2.metric("기간", f"{period[0]} ~ {period[1]}")
 c3.metric(f"{flu_col} 평균", f"{merged[flu_col].mean():,.2f}")
 c4.metric(f"{flu_col} 최댓값", f"{merged[flu_col].max():,.2f}")
 
+diffs = flu["DATE"].diff().dt.days.dropna()
+if not diffs.empty:
+    st.caption(f"인플루엔자 데이터의 날짜 간격(가장 흔한 값): {int(diffs.mode().iloc[0])}일")
+
 with st.expander("원본 인플루엔자 데이터 보기"):
     st.dataframe(flu_raw, use_container_width=True)
 with st.expander("합쳐진 데이터 보기"):
     st.dataframe(merged, use_container_width=True)
-    st.caption(f"결측값 개수: {int(merged[[flu_col] + weather_cols].isna().sum().sum())}")
+    st.caption(
+        f"결측값 개수: {int(merged[[flu_col] + weather_cols].isna().sum().sum())} / "
+        "WEATHER_DAYS = 그 구간에 포함된 날씨 데이터 일수"
+    )
 
 # ---------- 탭 ----------
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
@@ -130,8 +179,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 # 1. 이중 축 시계열
 with tab1:
-    wcol = st.selectbox("함께 볼 날씨 변수", weather_cols,
-                        format_func=lambda c: weather_names[c], index=2)
+    wcol = st.selectbox(
+        "함께 볼 날씨 변수", weather_cols,
+        format_func=lambda c: weather_names[c], index=2,
+    )
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=merged["DATE"], y=merged[flu_col],
                              name=flu_col, line=dict(color="crimson")))
@@ -148,8 +199,10 @@ with tab1:
 
 # 2. 산점도
 with tab2:
-    wcol2 = st.selectbox("X축 날씨 변수", weather_cols,
-                         format_func=lambda c: weather_names[c], index=2, key="sc")
+    wcol2 = st.selectbox(
+        "X축 날씨 변수", weather_cols,
+        format_func=lambda c: weather_names[c], index=2, key="sc",
+    )
     sub = merged[[wcol2, flu_col, "MONTH"]].dropna()
     fig = px.scatter(sub, x=wcol2, y=flu_col, color="MONTH", opacity=0.6,
                      color_continuous_scale="Turbo",
@@ -192,8 +245,10 @@ with tab3:
 with tab4:
     st.markdown("날씨가 변한 뒤 **몇 칸(행) 뒤**에 인플루엔자가 반응하는지 확인해요.")
     st.caption("데이터가 주 단위라면 1칸 = 1주예요.")
-    wcol3 = st.selectbox("날씨 변수", weather_cols,
-                         format_func=lambda c: weather_names[c], index=2, key="lag")
+    wcol3 = st.selectbox(
+        "날씨 변수", weather_cols,
+        format_func=lambda c: weather_names[c], index=2, key="lag",
+    )
     max_lag = st.slider("최대 시차(칸)", 1, 20, 8)
     rows = []
     for k in range(0, max_lag + 1):
