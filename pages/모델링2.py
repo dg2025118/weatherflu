@@ -9,10 +9,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-st.set_page_config(page_title="뉴욕 날씨와 독감 분석", layout="wide")
+st.set_page_config(
+    page_title="뉴욕 날씨와 독감 분석",
+    layout="wide"
+)
 
 st.title("뉴욕 날씨와 독감 발생량 분석")
-st.write("선형 회귀, 릿지 회귀, 랜덤 포레스트 회귀 비교")
+st.write("2009년부터 2021년까지의 데이터 분석")
 
 # 1. 데이터 불러오기
 DATA_URL = "https://raw.githubusercontent.com/dg2025118/weatherflu/refs/heads/main/%EB%8D%B0%EC%9D%B4%ED%84%B0%20%EC%A0%95%EB%A6%AC.csv"
@@ -27,7 +30,16 @@ except Exception as e:
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
 
-# 2. 필요한 열 선택
+# 2. 날짜 변환 및 2021년까지 필터링
+df["주마지막날짜"] = pd.to_datetime(
+    df["주마지막날짜"], errors="coerce"
+)
+
+df = df[
+    df["주마지막날짜"] <= "2021-12-31"
+].copy()
+
+# 3. 사용할 변수
 features = [
     "TMIN_AVG",
     "TMAX_AVG",
@@ -45,30 +57,31 @@ if not all(col in df.columns for col in required):
     st.error("CSV 파일의 열 이름을 확인해주세요.")
     st.stop()
 
-df["주마지막날짜"] = pd.to_datetime(
-    df["주마지막날짜"], errors="coerce"
-)
-
 for col in features + [target, "CDC주차"]:
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
 df = df.dropna(subset=required)
 df = df.sort_values("주마지막날짜").reset_index(drop=True)
 
-# 3. 주차 계절성 반영
-df["주차_sin"] = np.sin(2 * np.pi * df["CDC주차"] / 52)
-df["주차_cos"] = np.cos(2 * np.pi * df["CDC주차"] / 52)
+if len(df) < 30:
+    st.error("분석에 사용할 데이터가 너무 적습니다.")
+    st.stop()
+
+# 4. 계절성을 반영하는 주차 변수
+df["주차_sin"] = np.sin(
+    2 * np.pi * df["CDC주차"] / 52
+)
+
+df["주차_cos"] = np.cos(
+    2 * np.pi * df["CDC주차"] / 52
+)
 
 features += ["주차_sin", "주차_cos"]
 
 X = df[features]
 y = df[target]
 
-if len(df) < 30:
-    st.error("분석에 사용할 데이터가 너무 적습니다.")
-    st.stop()
-
-# 4. 시간 순서대로 데이터 분리
+# 5. 시간 순서대로 데이터 분리
 train_end = int(len(df) * 0.70)
 val_end = int(len(df) * 0.85)
 
@@ -84,7 +97,7 @@ y_train_val = y.iloc[:val_end]
 X_test = X.iloc[val_end:]
 y_test = y.iloc[val_end:]
 
-# 5. 랜덤 포레스트 설정 비교
+# 6. 랜덤 포레스트 설정 비교
 st.subheader("랜덤 포레스트 설정 비교")
 
 configs = [
@@ -119,7 +132,7 @@ st.write("선택된 랜덤 포레스트 설정")
 st.json(best_config)
 st.write(f"검증 데이터 MAE: {best_val_mae:,.2f}")
 
-# 6. 세 가지 회귀 모델 학습
+# 7. 세 가지 회귀 모델
 models = {
     "선형 회귀": LinearRegression(),
 
@@ -141,14 +154,15 @@ for name, model in models.items():
     model.fit(X_train_val, y_train_val)
     predictions[name] = model.predict(X_test)
 
-# 7. 베이스라인
+# 8. 베이스라인
 baseline_value = y_train_val.mean()
 
 predictions["베이스라인"] = np.full(
-    len(y_test), baseline_value
+    len(y_test),
+    baseline_value
 )
 
-# 8. 평가지표 계산
+# 9. 평가 지표 계산
 results = []
 
 for name, pred in predictions.items():
@@ -167,9 +181,8 @@ for name, pred in predictions.items():
 
 result_df = pd.DataFrame(results)
 
-# 9. 결과 출력
+# 10. 평가 결과
 st.subheader("모델별 평가 지표")
-st.caption("모든 모델은 동일한 최종 평가 데이터로 비교합니다.")
 
 st.dataframe(
     result_df,
@@ -177,18 +190,21 @@ st.dataframe(
     hide_index=True
 )
 
-# 10. MAE 비교
+# 11. MAE 비교
 st.subheader("MAE 기준 모델 비교")
 
-best_model = result_df.loc[result_df["MAE"].idxmin()]
+best_model = result_df.loc[
+    result_df["MAE"].idxmin()
+]
 
 st.success(
-    f"현재 가장 낮은 MAE 모델: {best_model['모델']} "
+    f"가장 낮은 MAE 모델: {best_model['모델']} "
     f"(MAE: {best_model['MAE']:,.3f})"
 )
 
 rf_mae = result_df.loc[
-    result_df["모델"] == "랜덤 포레스트 회귀", "MAE"
+    result_df["모델"] == "랜덤 포레스트 회귀",
+    "MAE"
 ].iloc[0]
 
 other_mae = result_df[
@@ -197,14 +213,14 @@ other_mae = result_df[
 
 if rf_mae < other_mae:
     st.success(
-        "랜덤 포레스트 회귀가 비교 모델 중 MAE가 가장 낮습니다."
+        "랜덤 포레스트 회귀의 MAE가 가장 낮습니다."
     )
 else:
     st.info(
-        "이번 평가에서는 다른 모델의 MAE가 더 낮았습니다."
+        "이번 평가에서는 다른 모델의 MAE가 더 낮습니다."
     )
 
-# 11. 실제값과 예측값 그래프
+# 12. 실제값과 예측값 그래프
 st.subheader("실제 독감 발생량과 예측값 비교")
 
 chart_df = pd.DataFrame({
@@ -216,17 +232,18 @@ chart_df = pd.DataFrame({
 
 st.line_chart(chart_df)
 
-# 12. 데이터 정보
+# 13. 데이터 정보
 st.subheader("분석 정보")
 
+st.write(f"- 분석 기간: {df['주마지막날짜'].min().date()} ~ {df['주마지막날짜'].max().date()}")
 st.write(f"- 전체 데이터: {len(df)}행")
 st.write(f"- 학습 및 검증 데이터: {val_end}행")
 st.write(f"- 최종 평가 데이터: {len(y_test)}행")
 st.write(f"- 입력 변수: {', '.join(features)}")
 st.write(f"- 랜덤 포레스트 설정: {best_config}")
-st.write("- 릿지 회귀 alpha: 1.0")
 
 st.warning(
     "MAE는 실제값과 예측값의 평균적인 차이입니다. "
-    "낮을수록 예측 성능이 좋습니다."
+    "낮을수록 좋습니다. 마지막 15%의 데이터는 "
+    "모델 학습에 사용하지 않고 평가에만 사용했습니다."
 )
