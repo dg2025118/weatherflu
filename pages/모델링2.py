@@ -3,9 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -136,9 +135,10 @@ st.write(f"검증 데이터 MAE: {best_val_mae:,.2f}")
 models = {
     "선형 회귀": LinearRegression(),
 
-    "릿지 회귀": make_pipeline(
-        StandardScaler(),
-        Ridge(alpha=1.0)
+    "결정 트리 회귀": DecisionTreeRegressor(
+        max_depth=5,
+        min_samples_leaf=3,
+        random_state=42
     ),
 
     "랜덤 포레스트 회귀": RandomForestRegressor(
@@ -227,7 +227,7 @@ chart_df = pd.DataFrame({
     "실제 독감 발생량": y_test.values,
     "랜덤 포레스트 예측": predictions["랜덤 포레스트 회귀"],
     "선형 회귀 예측": predictions["선형 회귀"],
-    "릿지 회귀 예측": predictions["릿지 회귀"]
+    "결정 트리 예측": predictions["결정 트리 회귀"]
 }, index=df["주마지막날짜"].iloc[val_end:])
 
 st.line_chart(chart_df)
@@ -235,7 +235,10 @@ st.line_chart(chart_df)
 # 13. 데이터 정보
 st.subheader("분석 정보")
 
-st.write(f"- 분석 기간: {df['주마지막날짜'].min().date()} ~ {df['주마지막날짜'].max().date()}")
+st.write(
+    f"- 분석 기간: {df['주마지막날짜'].min().date()} ~ "
+    f"{df['주마지막날짜'].max().date()}"
+)
 st.write(f"- 전체 데이터: {len(df)}행")
 st.write(f"- 학습 및 검증 데이터: {val_end}행")
 st.write(f"- 최종 평가 데이터: {len(y_test)}행")
